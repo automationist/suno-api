@@ -258,6 +258,73 @@ class SunoApi {
    * @returns {BrowserContext}
    */
   private async launchBrowser(): Promise<BrowserContext> {
+    // Check if CDP_BROWSER_ENDPOINT is set to connect to existing browser
+    const cdpEndpoint = process.env.CDP_BROWSER_ENDPOINT;
+    
+    if (cdpEndpoint) {
+      // Fix localhost to use IPv4 explicitly
+      const fixedEndpoint = cdpEndpoint.replace('localhost', '127.0.0.1');
+      logger.info(`Connecting to existing browser at ${fixedEndpoint}`);
+      try {
+        // Connect to existing browser via CDP
+        const browser = await chromium.connectOverCDP(fixedEndpoint);
+        const contexts = browser.contexts();
+        
+        // Use existing context if available, otherwise create new one
+        let context: BrowserContext;
+        if (contexts.length > 0) {
+          context = contexts[0];
+          logger.info('Using existing browser context with session cookies');
+        } else {
+          context = await browser.newContext({ 
+            userAgent: this.userAgent, 
+            locale: process.env.BROWSER_LOCALE,
+            viewport: null 
+          });
+          logger.info('Created new context in existing browser');
+        }
+        
+        // The existing browser should already have all cookies from your logged-in session
+        // But we can add additional cookies if needed
+        const cookies = [];
+        const lax: 'Lax' | 'Strict' | 'None' = 'Lax';
+        
+        // Only add the JWT token if we have one
+        if (this.currentToken) {
+          cookies.push({
+            name: '__session',
+            value: this.currentToken,
+            domain: '.suno.com',
+            path: '/',
+            sameSite: lax
+          });
+        }
+        
+        // Add any additional cookies from environment if they don't conflict
+        for (const key in this.cookies) {
+          if (key !== '__session') { // Don't duplicate session cookie
+            cookies.push({
+              name: key,
+              value: this.cookies[key]+'',
+              domain: '.suno.com',
+              path: '/',
+              sameSite: lax
+            });
+          }
+        }
+        
+        if (cookies.length > 0) {
+          await context.addCookies(cookies);
+        }
+        
+        return context;
+      } catch (error) {
+        logger.error(`Failed to connect to CDP endpoint: ${error}`);
+        logger.info('Falling back to launching new browser instance');
+      }
+    }
+
+    // Original browser launch code (fallback)
     const args = [
       '--disable-blink-features=AutomationControlled',
       '--disable-web-security',
