@@ -60,6 +60,7 @@ We have deployed an example bound to a free Suno account, so it has daily usage 
 ![get cookie](https://github.com/gcui-art/suno-api/blob/main/public/get-cookie-demo.gif)
 
 ### 2. Register on 2Captcha and top up your balance
+
 [2Captcha](https://2captcha.com/about) is a paid CAPTCHA solving service that uses real workers to solve the CAPTCHA and has high accuracy. It is needed because of Suno constantly requesting hCaptcha solving that currently isn't possible for free by any means.
 
 [Create](https://2captcha.com/auth/register?userType=customer) a new 2Captcha account, [top up](https://2captcha.com/pay) your balance and [get your API key](https://2captcha.com/enterpage#recognition).
@@ -85,8 +86,10 @@ git clone https://github.com/gcui-art/suno-api.git
 cd suno-api
 npm install
 ```
+
 #### Docker
->[!IMPORTANT]
+
+> [!IMPORTANT]
 > GPU acceleration will be disabled in Docker. If you have a slow CPU, it is recommended to [deploy locally](#run-locally).
 
 Alternatively, you can use [Docker Compose](https://docs.docker.com/compose/). However, follow the step below before running.
@@ -100,13 +103,16 @@ docker compose build && docker compose up
 - If deployed to Vercel, please add the environment variables in the Vercel dashboard.
 
 - If you’re running this locally, be sure to add the following to your `.env` file:
+
 #### Environment variables
+
 - `SUNO_COOKIE` — the `Cookie` header you obtained in the first step.
 - `TWOCAPTCHA_KEY` — your 2Captcha API key from the second step.
 - `BROWSER` — the name of the browser that is going to be used to solve the CAPTCHA. Only `chromium` and `firefox` supported.
 - `BROWSER_GHOST_CURSOR` — use ghost-cursor-playwright to simulate smooth mouse movements. Please note that it doesn't seem to make any difference in the rate of CAPTCHAs, so you can set it to `false`. Retained for future testing.
 - `BROWSER_LOCALE` — the language of the browser. Using either `en` or `ru` is recommended, since those have the most workers on 2Captcha. [List of supported languages](https://2captcha.com/2captcha-api#language)
 - `BROWSER_HEADLESS` — run the browser without the window. You probably want to set this to `true`.
+
 ```bash
 SUNO_COOKIE=<…>
 TWOCAPTCHA_KEY=<…>
@@ -159,6 +165,7 @@ Suno API currently mainly implements the following APIs:
 - `/api/get_aligned_lyrics`: Get list of timestamps for each word in the lyrics
 - `/api/clip`: Get clip information based on ID passed as query parameter `id`
 - `/api/concat`: Generate the whole song from extensions
+- `/api/download`: Download audio, video, or image files for a song
 ```
 
 You can also specify the cookies in the `Cookie` header of your request, overriding the default cookies in the `SUNO_COOKIE` environment variable. This comes in handy when, for example, you want to use multiple free accounts at the same time.
@@ -242,15 +249,15 @@ if __name__ == '__main__':
 ### JavaScript
 
 ```js
-const axios = require("axios");
+const axios = require('axios');
 
 // replace your vercel domain
-const baseUrl = "http://localhost:3000";
+const baseUrl = 'http://localhost:3000';
 
 async function customGenerateAudio(payload) {
   const url = `${baseUrl}/api/custom_generate`;
   const response = await axios.post(url, payload, {
-    headers: { "Content-Type": "application/json" },
+    headers: { 'Content-Type': 'application/json' }
   });
   return response.data;
 }
@@ -258,7 +265,7 @@ async function customGenerateAudio(payload) {
 async function generateAudioByPrompt(payload) {
   const url = `${baseUrl}/api/generate`;
   const response = await axios.post(url, payload, {
-    headers: { "Content-Type": "application/json" },
+    headers: { 'Content-Type': 'application/json' }
   });
   return response.data;
 }
@@ -266,7 +273,7 @@ async function generateAudioByPrompt(payload) {
 async function extendAudio(payload) {
   const url = `${baseUrl}/api/extend_audio`;
   const response = await axios.post(url, payload, {
-    headers: { "Content-Type": "application/json" },
+    headers: { 'Content-Type': 'application/json' }
   });
   return response.data;
 }
@@ -292,9 +299,9 @@ async function getClipInformation(clipId) {
 async function main() {
   const data = await generateAudioByPrompt({
     prompt:
-      "A popular heavy metal song about war, sung by a deep-voiced male singer, slowly and melodiously. The lyrics depict the sorrow of people after the war.",
+      'A popular heavy metal song about war, sung by a deep-voiced male singer, slowly and melodiously. The lyrics depict the sorrow of people after the war.',
     make_instrumental: false,
-    wait_audio: false,
+    wait_audio: false
   });
 
   const ids = `${data[0].id},${data[1].id}`;
@@ -302,7 +309,7 @@ async function main() {
 
   for (let i = 0; i < 60; i++) {
     const data = await getAudioInformation(ids);
-    if (data[0].status === "streaming") {
+    if (data[0].status === 'streaming') {
       console.log(`${data[0].id} ==> ${data[0].audio_url}`);
       console.log(`${data[1].id} ==> ${data[1].audio_url}`);
       break;
