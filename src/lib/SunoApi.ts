@@ -372,6 +372,12 @@ class SunoApi {
    * @returns {string|null} hCaptcha token. If no verification is required, returns null
    */
   public async getCaptcha(): Promise<string|null> {
+    // Skip CAPTCHA entirely when using CDP connection with authenticated browser
+    if (process.env.CDP_BROWSER_ENDPOINT) {
+      logger.info('Using authenticated browser via CDP - skipping CAPTCHA');
+      return null;
+    }
+    
     if (!await this.captchaRequired())
       return null;
 
@@ -567,6 +573,7 @@ class SunoApi {
    * @param make_instrumental Indicates if the generated audio should be instrumental.
    * @param wait_audio Indicates if the method should wait for the audio file to be fully generated before returning.
    * @param negative_tags Negative tags that should not be included in the generated audio.
+   * @param gpt_description_prompt Optional GPT description for auto-generated lyrics.
    * @returns A promise that resolves to an array of AudioInfo objects representing the generated audios.
    */
   public async custom_generate(
@@ -576,8 +583,10 @@ class SunoApi {
     make_instrumental: boolean = false,
     model?: string,
     wait_audio: boolean = false,
-    negative_tags?: string
+    negative_tags?: string,
+    gpt_description_prompt?: string
   ): Promise<AudioInfo[]> {
+    logger.info(`custom_generate called with gpt_description_prompt: ${gpt_description_prompt}`);
     const startTime = Date.now();
     const audios = await this.generateSongs(
       prompt,
@@ -587,7 +596,11 @@ class SunoApi {
       make_instrumental,
       model,
       wait_audio,
-      negative_tags
+      negative_tags,
+      undefined, // task
+      undefined, // continue_clip_id
+      undefined, // continue_at
+      gpt_description_prompt
     );
     const costTime = Date.now() - startTime;
     logger.info(
@@ -622,9 +635,12 @@ class SunoApi {
     negative_tags?: string,
     task?: string,
     continue_clip_id?: string,
-    continue_at?: number
+    continue_at?: number,
+    gpt_description_prompt?: string
   ): Promise<AudioInfo[]> {
+    logger.info(`generateSongs called with gpt_description_prompt: ${gpt_description_prompt}, isCustom: ${isCustom}`);
     await this.keepAlive();
+    const captchaToken = await this.getCaptcha();
     const payload: any = {
       make_instrumental: make_instrumental,
       mv: model || DEFAULT_MODEL,
@@ -632,34 +648,29 @@ class SunoApi {
       generation_type: 'TEXT',
       continue_at: continue_at,
       continue_clip_id: continue_clip_id,
-      task: task,
-      token: await this.getCaptcha()
+      task: task
     };
+    
+    // Only include token if we have one (not using CDP authenticated browser)
+    if (captchaToken !== null) {
+      payload.token = captchaToken;
+    }
     if (isCustom) {
       payload.tags = tags;
       payload.title = title;
       payload.negative_tags = negative_tags;
-      payload.prompt = prompt;
+      // If gpt_description_prompt is provided, use it for auto-generated lyrics
+      if (gpt_description_prompt) {
+        payload.gpt_description_prompt = gpt_description_prompt;
+        payload.prompt = '';  // Empty prompt for auto-generated lyrics
+        logger.info(`Setting gpt_description_prompt in payload: ${gpt_description_prompt}`);
+      } else {
+        payload.prompt = prompt;  // Use explicit lyrics
+      }
     } else {
       payload.gpt_description_prompt = prompt;
     }
-    logger.info(
-      'generateSongs payload:\n' +
-        JSON.stringify(
-          {
-            prompt: prompt,
-            isCustom: isCustom,
-            tags: tags,
-            title: title,
-            make_instrumental: make_instrumental,
-            wait_audio: wait_audio,
-            negative_tags: negative_tags,
-            payload: payload
-          },
-          null,
-          2
-        )
-    );
+    logger.info(`Final payload before sending: ${JSON.stringify(payload, null, 2)}`);
     const response = await this.client.post(
       `${SunoApi.BASE_URL}/api/generate/v2/`,
       payload,
@@ -760,7 +771,7 @@ class SunoApi {
     model?: string,
     wait_audio?: boolean
   ): Promise<AudioInfo[]> {
-    return this.generateSongs(prompt, true, tags, title, false, model, wait_audio, negative_tags, 'extend', audioId, continueAt);
+    return this.generateSongs(prompt, true, tags, title, false, model, wait_audio, negative_tags, 'extend', audioId, continueAt, undefined);
   }
 
   /**

@@ -14,21 +14,22 @@ async function customGenerateMusic({
   instrumental = false,
   model = 'chirp-auk', // v4.5 model
   waitAudio = false,
-  negativeTagsString = ''
+  negativeTagsString = '',
+  autoLyrics = false  // New parameter for auto-generated lyrics
 }) {
   try {
     console.log('🎵 Generating custom music...');
     console.log(`Title: ${title}`);
     console.log(`Description: ${description}`);
     console.log(`Lyrics: ${lyricDescription}`);
+    console.log(`Auto Lyrics: ${autoLyrics}`);
     console.log(`Instrumental: ${instrumental}`);
     console.log(`Model: ${model}`);
     console.log('---');
 
     const payload = {
-      prompt: lyricDescription,     // This becomes the lyrics/prompt
-      gpt_description_prompt: lyricDescription,     // This becomes the lyrics/prompt
-
+      prompt: autoLyrics ? '' : lyricDescription,  // Empty for auto lyrics
+      gpt_description_prompt: autoLyrics ? lyricDescription : undefined,  // Description for auto lyrics
       tags: description,           // Musical style description
       title: title,               // Song title
       make_instrumental: instrumental,
@@ -36,6 +37,11 @@ async function customGenerateMusic({
       wait_audio: waitAudio,
       negative_tags: negativeTagsString
     };
+
+    // Remove undefined fields
+    Object.keys(payload).forEach(key => payload[key] === undefined && delete payload[key]);
+
+    console.log('\n📦 Sending payload:', JSON.stringify(payload, null, 2));
 
     const response = await axios.post(`${baseUrl}/api/custom_generate`, payload, {
       headers: {
@@ -103,13 +109,17 @@ Options:
   --wait             Wait for audio generation to complete (default: false)
   --base-url <url>   API base URL (default: http://localhost:3000)
   --negative-tags <tags> Negative tags to avoid
+  --auto-lyrics      Generate lyrics automatically from description (default: false)
 
 Examples:
+  # With explicit lyrics
   node custom-generate.js "Summer Dreams" "upbeat pop, electronic, dance" "Lyrics about summer vacation and freedom"
   
-  node custom-generate.js "Painful Realization" "68 BPM, melancholic piano-led orchestral" "I love you but I'm breaking, I can't stay, set me free" --instrumental
+  # With auto-generated lyrics
+  node custom-generate.js "Painful Realization" "68 BPM, melancholic piano-led orchestral" "A song about heartbreak and letting go" --auto-lyrics
   
-  node custom-generate.js "Ana's Farewell" "ambient pop, intimate, melancholic" "Sparse phrases echo Ana's internal monologue: I love you… but I'm breaking… I can't stay… set me free" --model chirp-auk --wait
+  # Your specific use case (auto lyrics)
+  node custom-generate.js "Ana's Farewell" "ambient pop, intimate, melancholic" "Sparse phrases echo Ana's internal monologue: I love you… but I'm breaking… I can't stay… set me free" --auto-lyrics --wait
 `);
     process.exit(1);
   }
@@ -127,7 +137,8 @@ Examples:
     waitAudio: args.includes('--wait'),
     model: 'chirp-auk',
     baseUrl: 'http://localhost:3000',
-    negativeTagsString: ''
+    negativeTagsString: '',
+    autoLyrics: args.includes('--auto-lyrics') // Parse new option
   };
 
   // Parse model option
