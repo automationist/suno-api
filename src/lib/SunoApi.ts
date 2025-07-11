@@ -87,7 +87,7 @@ class SunoApi {
     this.userAgent = new UserAgent(/Macintosh/).random().toString(); // Usually Mac systems get less amount of CAPTCHAs
     this.cookies = cookies ? cookie.parse(cookies) : {};
     this.deviceId = this.cookies.ajs_anonymous_id || randomUUID();
-    this.useExistingBrowser = useExistingBrowser;
+    this.useExistingBrowser = useExistingBrowser || yn(process.env.USE_EXISTING_BROWSER, { default: false });
     this.client = axios.create({
       withCredentials: true,
       headers: {
@@ -209,6 +209,12 @@ class SunoApi {
   }
 
   private async captchaRequired(): Promise<boolean> {
+    // Skip CAPTCHA check if using existing browser with authentication cookies
+    if (this.useExistingBrowser && this.cookies.__client && this.cookies.__session) {
+      logger.info('Using existing browser with valid cookies, assuming no CAPTCHA required');
+      return false;
+    }
+    
     const resp = await this.client.post(`${SunoApi.BASE_URL}/api/c/check`, {
       ctype: 'generation'
     });
@@ -265,27 +271,72 @@ class SunoApi {
   private async connectToExistingBrowser(): Promise<BrowserContext> {
     const browserType = this.getBrowserType();
     
-    // Connect to existing Chrome instance
-    const browser = await browserType.connect({
-      wsEndpoint: 'ws://localhost:9222' // Chrome's WebSocket endpoint
-    });
-
-    // Create a new context or use existing one
-    const contexts = browser.contexts();
-    let context: BrowserContext;
+    // Get debugging port from environment or use default
+    const debugPort = process.env.CHROME_DEBUG_PORT || '9222';
+    const debugHost = process.env.CHROME_DEBUG_HOST || 'localhost';
     
-    if (contexts.length > 0) {
-      // Use existing context
-      context = contexts[0];
-    } else {
-      // Create new context
-      context = await browser.newContext({
-        userAgent: this.userAgent,
-        locale: process.env.BROWSER_LOCALE
-      });
-    }
+    try {
+      // Get list of pages from Chrome DevTools
+      const pagesResponse = await axios.get(`http://${debugHost}:${debugPort}/json`);
+      const pages = pagesResponse.data;
+      
+      logger.info(`Found ${pages.length} pages in Chrome`);
+      
+      // Find a Suno page if available
+      const sunoPage = pages.find((page: any) => 
+        page.url && page.url.includes('suno.com') && page.type === 'page'
+      );
+      
+      if (sunoPage) {
+        logger.info(`Found Suno page: ${sunoPage.url}`);
+      }
+      
+      // Connect using CDP endpoint URL
+      const cdpUrl = `http://${debugHost}:${debugPort}`;
+      logger.info(`Connecting to Chrome via CDP at ${cdpUrl}`);
+      
+      // Use connectOverCDP which is more reliable for existing browsers
+      const browser = await browserType.connectOverCDP(cdpUrl);
+      logger.info('Connected to browser successfully');
 
-    return context;
+      // Get all browser contexts
+      const contexts = browser.contexts();
+      
+      if (contexts.length === 0) {
+        // This shouldn't happen with a real browser, but handle it
+        logger.warn('No contexts found, creating a new one');
+        const context = await browser.newContext({
+          userAgent: this.userAgent,
+          locale: process.env.BROWSER_LOCALE
+        });
+        return context;
+      }
+      
+      // Use the default context (the main browser window)
+      const context = contexts[0];
+      logger.info(`Using default browser context with ${context.pages().length} pages`);
+      
+      return context;
+    } catch (error: any) {
+      logger.error(`Failed to connect to Chrome at ${debugHost}:${debugPort}:`, error.message);
+      if (error.message.includes('connectOverCDP')) {
+        logger.info('Falling back to WebSocket connection...');
+        // Fallback to WebSocket connection
+        try {
+          const versionResponse = await axios.get(`http://${debugHost}:${debugPort}/json/version`);
+          const wsEndpoint = versionResponse.data.webSocketDebuggerUrl;
+          const browser = await browserType.connect({ wsEndpoint });
+          const contexts = browser.contexts();
+          return contexts[0] || await browser.newContext({
+            userAgent: this.userAgent,
+            locale: process.env.BROWSER_LOCALE
+          });
+        } catch (wsError: any) {
+          logger.error('WebSocket connection also failed:', wsError.message);
+        }
+      }
+      throw error;
+    }
   }
 
   /**
@@ -294,34 +345,68 @@ class SunoApi {
    */
   private async syncCookiesFromBrowser(): Promise<void> {
     try {
+      logger.info('Syncing cookies from existing browser...');
       const context = await this.connectToExistingBrowser();
       const pages = context.pages();
       
       // Get or create a page
-      const page = pages.length > 0 ? pages[0] : await context.newPage();
+      let page = pages.length > 0 ? pages[0] : await context.newPage();
       
-      // Navigate to Suno if not already there
-      if (!page.url().includes('suno.com')) {
-        await page.goto('https://suno.com');
+      // Find a page with suno.com already loaded, or navigate to it
+      let sunoPage = null;
+      for (const p of pages) {
+        const url = p.url();
+        if (url.includes('suno.com')) {
+          sunoPage = p;
+          logger.info(`Found existing Suno page: ${url}`);
+          break;
+        }
       }
       
-      // Get cookies from the browser
+      if (sunoPage) {
+        page = sunoPage;
+      } else if (!page.url().includes('suno.com')) {
+        logger.info('Navigating to suno.com to get cookies...');
+        await page.goto('https://suno.com', { waitUntil: 'domcontentloaded' });
+        await page.waitForTimeout(2000); // Give it time to load
+      }
+      
+      // Get cookies from all URLs
       const browserCookies = await context.cookies();
       
       // Update our cookie store
       const newCookies: Record<string, string> = {};
+      let foundClerkCookie = false;
+      let foundSessionCookie = false;
+      
       for (const cookie of browserCookies) {
-        if (cookie.domain.includes('suno.com') || cookie.domain.includes('clerk.suno.com')) {
+        if (cookie.domain.includes('suno.com') || cookie.domain.includes('clerk')) {
           newCookies[cookie.name] = cookie.value;
+          if (cookie.name === '__client') {
+            foundClerkCookie = true;
+            logger.info('Found __client cookie');
+          }
+          if (cookie.name === '__session') {
+            foundSessionCookie = true;
+            logger.info('Found __session cookie');
+          }
         }
       }
       
       // Merge with existing cookies
       this.cookies = { ...this.cookies, ...newCookies };
       
-      console.log('Cookies synced from browser:', Object.keys(newCookies));
-    } catch (error) {
-      console.error('Failed to sync cookies from browser:', error);
+      logger.info(`Cookies synced from browser: ${Object.keys(newCookies).length} cookies found`);
+      logger.info('Cookie names:', Object.keys(newCookies));
+      
+      if (!foundClerkCookie) {
+        logger.warn('Warning: __client cookie not found. You may need to log in to Suno in the browser.');
+      }
+      
+      // Don't close the browser context - keep it open for reuse
+    } catch (error: any) {
+      logger.error('Failed to sync cookies from browser:', error);
+      throw error; // Re-throw to handle it properly in init()
     }
   }
 
@@ -330,35 +415,45 @@ class SunoApi {
    * @returns {BrowserContext}
    */
   private async launchBrowser(): Promise<BrowserContext> {
-    // First try to connect to existing browser
-    try {
-      const context = await this.connectToExistingBrowser();
-      console.log('Connected to existing Chrome browser');
-      return context;
-    } catch (error) {
-      console.log('Could not connect to existing browser, launching new one...');
-      
-      // Fallback to original method
-      const args = [
-        '--disable-blink-features=AutomationControlled',
-        '--disable-web-security',
-        '--no-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-features=site-per-process',
-        '--disable-features=IsolateOrigins',
-        '--disable-extensions',
-        '--disable-infobars'
-      ];
-      
-      if (yn(process.env.BROWSER_DISABLE_GPU, { default: false }))
-        args.push('--enable-unsafe-swiftshader',
-          '--disable-gpu',
-          '--disable-setuid-sandbox');
-      
-      const browser = await this.getBrowserType().launch({
-        args,
-        headless: yn(process.env.BROWSER_HEADLESS, { default: true })
-      });
+    // First try to connect to existing browser if enabled
+    if (this.useExistingBrowser) {
+      try {
+        const context = await this.connectToExistingBrowser();
+        logger.info('Successfully connected to existing Chrome browser');
+        return context;
+      } catch (error: any) {
+        logger.warn('Could not connect to existing browser:', error.message);
+        if (yn(process.env.REQUIRE_EXISTING_BROWSER, { default: false })) {
+          throw new Error('Failed to connect to existing browser and REQUIRE_EXISTING_BROWSER is set');
+        }
+        logger.info('Falling back to launching new browser...');
+      }
+    }
+    
+    // Fallback to launching a new browser
+    const args = [
+      '--disable-blink-features=AutomationControlled',
+      '--disable-web-security',
+      '--no-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-features=site-per-process',
+      '--disable-features=IsolateOrigins',
+      '--disable-extensions',
+      '--disable-infobars'
+    ];
+    
+    if (yn(process.env.BROWSER_DISABLE_GPU, { default: false }))
+      args.push('--enable-unsafe-swiftshader',
+        '--disable-gpu',
+        '--disable-setuid-sandbox');
+    
+    const headless = yn(process.env.BROWSER_HEADLESS, { default: true });
+    logger.info(`Launching browser in ${headless ? 'headless' : 'non-headless'} mode`);
+    
+    const browser = await this.getBrowserType().launch({
+      args,
+      headless
+    });
       
       const context = await browser.newContext({ 
         userAgent: this.userAgent, 
@@ -388,7 +483,6 @@ class SunoApi {
       
       await context.addCookies(cookies);
       return context;
-    }
   }
 
   /**
@@ -396,33 +490,101 @@ class SunoApi {
    * @returns {string|null} hCaptcha token. If no verification is required, returns null
    */
   public async getCaptcha(): Promise<string|null> {
+    // If using existing browser with valid session, skip CAPTCHA check
+    if (this.useExistingBrowser && this.currentToken) {
+      logger.info('Using existing browser with valid token, skipping CAPTCHA check');
+      return null;
+    }
+    
     if (!await this.captchaRequired())
       return null;
 
     logger.info('CAPTCHA required. Launching browser...')
-    const browser = await this.launchBrowser();
-    const page = await browser.newPage();
-    await page.goto('https://suno.com/create', { referer: 'https://www.google.com/', waitUntil: 'domcontentloaded', timeout: 0 });
+    const context = await this.launchBrowser();
+    
+    // When using existing browser, try to reuse existing pages
+    let page;
+    if (this.useExistingBrowser) {
+      const pages = context.pages();
+      
+      // Find a Suno create page
+      const createPage = pages.find(p => p.url().includes('suno.com/create'));
+      if (createPage) {
+        logger.info('Reusing existing create page');
+        page = createPage;
+      } else {
+        // Find any Suno page and navigate to create
+        const sunoPage = pages.find(p => p.url().includes('suno.com'));
+        if (sunoPage) {
+          logger.info('Found Suno page, navigating to create');
+          page = sunoPage;
+          await page.goto('https://suno.com/create', { waitUntil: 'domcontentloaded', timeout: 30000 });
+        } else {
+          logger.info('Creating new page');
+          page = await context.newPage();
+          await page.goto('https://suno.com/create', { referer: 'https://www.google.com/', waitUntil: 'domcontentloaded', timeout: 0 });
+        }
+      }
+    } else {
+      page = await context.newPage();
+      await page.goto('https://suno.com/create', { referer: 'https://www.google.com/', waitUntil: 'domcontentloaded', timeout: 0 });
+    }
 
     logger.info('Waiting for Suno interface to load');
-    // await page.locator('.react-aria-GridList').waitFor({ timeout: 60000 });
-    await page.waitForResponse('**/api/project/**\\?**', { timeout: 60000 }); // wait for song list API call
+    
+    try {
+      // Wait for the page to be ready - look for multiple possible indicators
+      await Promise.race([
+        page.waitForResponse('**/api/project/**\\?**', { timeout: 30000 }),
+        page.locator('.custom-textarea').waitFor({ timeout: 30000 }),
+        page.locator('button[aria-label="Create"]').waitFor({ timeout: 30000 })
+      ]);
+    } catch (e) {
+      logger.warn('Page load indicators timeout, continuing anyway...');
+    }
 
     if (this.ghostCursorEnabled)
       this.cursor = await createCursor(page);
     
     logger.info('Triggering the CAPTCHA');
+    
+    // Close any popups
     try {
-      await page.getByLabel('Close').click({ timeout: 2000 }); // close all popups
-      // await this.click(page, { x: 318, y: 13 });
-    } catch(e) {}
+      await page.getByLabel('Close').click({ timeout: 2000 });
+    } catch(e) {
+      // Popup might not exist
+    }
+
+    // Check if the create button exists
+    const createButton = page.locator('button[aria-label="Create"]');
+    const buttonExists = await createButton.count() > 0;
+    
+    if (!buttonExists) {
+      logger.warn('Create button not found, checking if we are on the correct page');
+      // Take a screenshot for debugging
+      const screenshot = await page.screenshot();
+      logger.info('Current page URL:', page.url());
+      
+      // If we're not on the create page, navigate there
+      if (!page.url().includes('/create')) {
+        logger.info('Not on create page, navigating...');
+        await page.goto('https://suno.com/create', { waitUntil: 'domcontentloaded' });
+        await page.waitForTimeout(3000);
+      }
+      
+      // Check again
+      const retryButtonExists = await createButton.count() > 0;
+      if (!retryButtonExists) {
+        throw new Error('Create button not found even after navigation. The page layout might have changed.');
+      }
+    }
 
     const textarea = page.locator('.custom-textarea');
     await this.click(textarea);
     await textarea.pressSequentially('Lorem ipsum', { delay: 80 });
 
     const button = page.locator('button[aria-label="Create"]').locator('div.flex');
-    this.click(button);
+    await this.click(button);
 
     const controller = new AbortController();
     new Promise<void>(async (resolve, reject) => {
@@ -499,7 +661,7 @@ class SunoApi {
           reject(e);
       }
     }).catch(e => {
-      browser.browser()?.close();
+      context.browser()?.close();
       throw e;
     });
     return (new Promise((resolve, reject) => {
@@ -507,7 +669,7 @@ class SunoApi {
         try {
           logger.info('hCaptcha token received. Closing browser');
           route.abort();
-          browser.browser()?.close();
+          context.browser()?.close();
           controller.abort();
           const request = route.request();
           this.currentToken = request.headers().authorization.split('Bearer ').pop();
@@ -656,9 +818,22 @@ class SunoApi {
       generation_type: 'TEXT',
       continue_at: continue_at,
       continue_clip_id: continue_clip_id,
-      task: task,
-      token: await this.getCaptcha()
+      task: task
     };
+    
+    // Only get CAPTCHA token if NOT using existing browser
+    if (!this.useExistingBrowser) {
+      logger.info('Not using existing browser, checking for CAPTCHA...');
+      const captchaToken = await this.getCaptcha();
+      // Only add token to payload if we actually have one
+      if (captchaToken) {
+        payload.token = captchaToken;
+      }
+    } else {
+      logger.info('Using existing browser, omitting token from payload');
+      // Don't add token field at all when using existing browser
+    }
+    
     if (isCustom) {
       payload.tags = tags;
       payload.title = title;
@@ -952,8 +1127,11 @@ export const sunoApi = async (cookie?: string) => {
   if (cachedInstance)
     return cachedInstance;
 
+  // Check if we should use existing browser from environment
+  const useExistingBrowser = yn(process.env.USE_EXISTING_BROWSER, { default: false });
+
   // If not, create a new instance and initialize it
-  const instance = await new SunoApi(resolvedCookie).init();
+  const instance = await new SunoApi(resolvedCookie, useExistingBrowser).init();
   // Cache the initialized instance
   cache.set(resolvedCookie, instance);
 
