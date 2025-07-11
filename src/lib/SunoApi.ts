@@ -81,11 +81,13 @@ class SunoApi {
   private solver = new Solver(process.env.TWOCAPTCHA_KEY + '');
   private ghostCursorEnabled = yn(process.env.BROWSER_GHOST_CURSOR, { default: false });
   private cursor?: Cursor;
+  private useExistingBrowser: boolean = false;
 
-  constructor(cookies: string) {
+  constructor(cookies?: string, useExistingBrowser: boolean = false) {
     this.userAgent = new UserAgent(/Macintosh/).random().toString(); // Usually Mac systems get less amount of CAPTCHAs
-    this.cookies = cookie.parse(cookies);
+    this.cookies = cookies ? cookie.parse(cookies) : {};
     this.deviceId = this.cookies.ajs_anonymous_id || randomUUID();
+    this.useExistingBrowser = useExistingBrowser;
     this.client = axios.create({
       withCredentials: true,
       headers: {
@@ -121,7 +123,10 @@ class SunoApi {
   }
 
   public async init(): Promise<SunoApi> {
-    //await this.getClerkLatestVersion();
+    if (this.useExistingBrowser) {
+      await this.syncCookiesFromBrowser();
+    }
+    
     await this.getAuthToken();
     await this.keepAlive();
     return this;
@@ -254,50 +259,136 @@ class SunoApi {
   }
 
   /**
-   * Launches a browser with the necessary cookies
+   * Connect to an existing Chrome browser instance
+   * @returns {BrowserContext}
+   */
+  private async connectToExistingBrowser(): Promise<BrowserContext> {
+    const browserType = this.getBrowserType();
+    
+    // Connect to existing Chrome instance
+    const browser = await browserType.connect({
+      wsEndpoint: 'ws://localhost:9222' // Chrome's WebSocket endpoint
+    });
+
+    // Create a new context or use existing one
+    const contexts = browser.contexts();
+    let context: BrowserContext;
+    
+    if (contexts.length > 0) {
+      // Use existing context
+      context = contexts[0];
+    } else {
+      // Create new context
+      context = await browser.newContext({
+        userAgent: this.userAgent,
+        locale: process.env.BROWSER_LOCALE
+      });
+    }
+
+    return context;
+  }
+
+  /**
+   * Get cookies from the existing browser
+   * @returns {Promise<void>}
+   */
+  private async syncCookiesFromBrowser(): Promise<void> {
+    try {
+      const context = await this.connectToExistingBrowser();
+      const pages = context.pages();
+      
+      // Get or create a page
+      const page = pages.length > 0 ? pages[0] : await context.newPage();
+      
+      // Navigate to Suno if not already there
+      if (!page.url().includes('suno.com')) {
+        await page.goto('https://suno.com');
+      }
+      
+      // Get cookies from the browser
+      const browserCookies = await context.cookies();
+      
+      // Update our cookie store
+      const newCookies: Record<string, string> = {};
+      for (const cookie of browserCookies) {
+        if (cookie.domain.includes('suno.com') || cookie.domain.includes('clerk.suno.com')) {
+          newCookies[cookie.name] = cookie.value;
+        }
+      }
+      
+      // Merge with existing cookies
+      this.cookies = { ...this.cookies, ...newCookies };
+      
+      console.log('Cookies synced from browser:', Object.keys(newCookies));
+    } catch (error) {
+      console.error('Failed to sync cookies from browser:', error);
+    }
+  }
+
+  /**
+   * Modified launchBrowser method to connect to existing browser
    * @returns {BrowserContext}
    */
   private async launchBrowser(): Promise<BrowserContext> {
-    const args = [
-      '--disable-blink-features=AutomationControlled',
-      '--disable-web-security',
-      '--no-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-features=site-per-process',
-      '--disable-features=IsolateOrigins',
-      '--disable-extensions',
-      '--disable-infobars'
-    ];
-    // Check for GPU acceleration, as it is recommended to turn it off for Docker
-    if (yn(process.env.BROWSER_DISABLE_GPU, { default: false }))
-      args.push('--enable-unsafe-swiftshader',
-        '--disable-gpu',
-        '--disable-setuid-sandbox');
-    const browser = await this.getBrowserType().launch({
-      args,
-      headless: yn(process.env.BROWSER_HEADLESS, { default: true })
-    });
-    const context = await browser.newContext({ userAgent: this.userAgent, locale: process.env.BROWSER_LOCALE, viewport: null });
-    const cookies = [];
-    const lax: 'Lax' | 'Strict' | 'None' = 'Lax';
-    cookies.push({
-      name: '__session',
-      value: this.currentToken+'',
-      domain: '.suno.com',
-      path: '/',
-      sameSite: lax
-    });
-    for (const key in this.cookies) {
+    // First try to connect to existing browser
+    try {
+      const context = await this.connectToExistingBrowser();
+      console.log('Connected to existing Chrome browser');
+      return context;
+    } catch (error) {
+      console.log('Could not connect to existing browser, launching new one...');
+      
+      // Fallback to original method
+      const args = [
+        '--disable-blink-features=AutomationControlled',
+        '--disable-web-security',
+        '--no-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-features=site-per-process',
+        '--disable-features=IsolateOrigins',
+        '--disable-extensions',
+        '--disable-infobars'
+      ];
+      
+      if (yn(process.env.BROWSER_DISABLE_GPU, { default: false }))
+        args.push('--enable-unsafe-swiftshader',
+          '--disable-gpu',
+          '--disable-setuid-sandbox');
+      
+      const browser = await this.getBrowserType().launch({
+        args,
+        headless: yn(process.env.BROWSER_HEADLESS, { default: true })
+      });
+      
+      const context = await browser.newContext({ 
+        userAgent: this.userAgent, 
+        locale: process.env.BROWSER_LOCALE, 
+        viewport: null 
+      });
+      
+      const cookies = [];
+      const lax: 'Lax' | 'Strict' | 'None' = 'Lax';
       cookies.push({
-        name: key,
-        value: this.cookies[key]+'',
+        name: '__session',
+        value: this.currentToken+'',
         domain: '.suno.com',
         path: '/',
         sameSite: lax
-      })
+      });
+      
+      for (const key in this.cookies) {
+        cookies.push({
+          name: key,
+          value: this.cookies[key]+'',
+          domain: '.suno.com',
+          path: '/',
+          sameSite: lax
+        })
+      }
+      
+      await context.addCookies(cookies);
+      return context;
     }
-    await context.addCookies(cookies);
-    return context;
   }
 
   /**
